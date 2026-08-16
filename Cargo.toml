@@ -1,0 +1,29 @@
+# The extension itself: a WebAssembly component Zed loads.
+#
+# The rules are NOT here. They are in `stratify/`, and `stratify-lsp/` serves
+# them over LSP — because a Zed extension cannot publish diagnostics, only
+# launch a language server. Everything this crate does is find that binary.
+[package]
+name = "zed_stratify"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7"
+
+# The server builds for the host; only this crate builds for wasm. Keeping it
+# the sole default member is what stops `cargo build --target wasm32-wasip1`
+# — which is how Zed builds an extension — from dragging the server along.
+[workspace]
+members = ["stratify", "stratify-lsp"]
+default-members = ["."]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"

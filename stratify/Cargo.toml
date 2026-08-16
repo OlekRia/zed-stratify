@@ -1,0 +1,11 @@
+[package]
+name = "stratify"
+description = "Dependencies above dependents: the stratification rules, as a library."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No dependencies, on purpose. This is read by a language server and by the
+# test that gates a codebase; a shared rule engine that drags a tree behind it
+# gets copied instead of shared, and then there are two rules.
+[dependencies]

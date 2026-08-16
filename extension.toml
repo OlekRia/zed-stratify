@@ -1,0 +1,28 @@
+id = "stratify"
+name = "Stratify"
+version = "0.1.0"
+schema_version = 1
+authors = ["alex@mycloudgrocer.com"]
+description = "Dependencies above dependents — F#-style stratification, shown as you type."
+repository = "https://github.com/OlekRia/zed-stratify"
+
+# Zed extensions cannot publish diagnostics. An extension may LAUNCH a language
+# server, and the server is what marks up a buffer — so everything this
+# extension does is find `stratify-lsp` and start it.
+[language_servers.stratify]
+name = "Stratify"
+language = "Rust"
+languages = []
+
+# Zed 1.x gates an extension's right to run a binary. Without this the launch
+# is refused and the server simply never starts — which looks exactly like a
+# codebase with nothing wrong in it.
+[[capabilities]]
+kind = "process:exec"
+command = "stratify-lsp"
+args = ["**"]
+
+[[capabilities]]
+kind = "process:exec"
+command = "**/stratify-lsp"
+args = ["**"]

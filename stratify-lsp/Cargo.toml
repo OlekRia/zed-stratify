@@ -1,0 +1,10 @@
+[package]
+name = "stratify-lsp"
+description = "A language server publishing the stratification rules as diagnostics — what the Zed extension launches."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+stratify = { path = "../stratify" }
+serde_json = "1"
