@@ -35,11 +35,15 @@
 //! function of the text. Only [`check_file`] and [`check_tree`] read the disk,
 //! which is what lets the editor check a buffer you have not saved.
 
+mod fix;
+
+pub use fix::fix_source;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Which scale a violation is at. The editor shows this; the test prints it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Rule {
     /// An item defined above something it uses.
     Item,
@@ -263,6 +267,21 @@ fn inline_module_name(line: &str) -> Option<String> {
     Some(name)
 }
 
+/// The part of a file that says what the module DEPENDS ON: production code,
+/// no tests and no prose.
+///
+/// Both exclusions were bugs before they were rules. A test module reaches for
+/// everything — `diagnostics`'s tests call `build_router` — and counting that
+/// made `diagnostics` depend on `router`, which closed a false cycle with
+/// `router -> browse` and SILENTLY SUPPRESSED a real violation, because cycles
+/// are vacuous. Comments are excluded for the reason the item rule already
+/// gives: a doc comment naming a module is not a call to it.
+fn architecture_of(source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let cut = tests_begin(source).min(lines.len());
+    code_only(&lines[..cut])
+}
+
 /// The name in `mod X;`, if this line is one. At column zero only.
 fn declared_module_name(line: &str) -> Option<String> {
     let mut rest = line;
@@ -425,7 +444,7 @@ fn declarations_of(dir: &Path, source: &str) -> Vec<Declaration> {
 
         let mut owned = String::new();
         if let Ok(text) = std::fs::read_to_string(dir.join(format!("{name}.rs"))) {
-            owned.push_str(&text);
+            owned.push_str(&architecture_of(&text));
         }
         let sub = dir.join(&name);
         if sub.is_dir() {
@@ -434,7 +453,7 @@ fn declarations_of(dir: &Path, source: &str) -> Vec<Declaration> {
             for f in files {
                 if let Ok(text) = std::fs::read_to_string(f) {
                     owned.push('\n');
-                    owned.push_str(&text);
+                    owned.push_str(&architecture_of(&text));
                 }
             }
         }
@@ -489,6 +508,19 @@ fn reaches_for(source: &str, sibling: &Declaration) -> bool {
         .any(|l| sibling.exports.iter().any(|item| names(l, item)))
 }
 
+/// Which declaration reaches for which. Shared with the fixer, so what gets
+/// moved is decided by the same edges that reported the fault.
+fn module_edges(declared: &[Declaration]) -> BTreeMap<usize, BTreeSet<usize>> {
+    let mut uses = BTreeMap::new();
+    for (n, decl) in declared.iter().enumerate() {
+        let deps = (0..declared.len())
+            .filter(|m| *m != n && reaches_for(&decl.owned, &declared[*m]))
+            .collect();
+        uses.insert(n, deps);
+    }
+    uses
+}
+
 /// Modules declared above a sibling they use.
 fn module_violations(path: &Path, source: &str) -> Vec<Violation> {
     let is_list = path
@@ -503,16 +535,7 @@ fn module_violations(path: &Path, source: &str) -> Vec<Violation> {
         return Vec::new();
     }
 
-    let mut uses: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-    for (n, decl) in declared.iter().enumerate() {
-        let mut deps = BTreeSet::new();
-        for (m, other) in declared.iter().enumerate() {
-            if m != n && reaches_for(&decl.owned, other) {
-                deps.insert(m);
-            }
-        }
-        uses.insert(n, deps);
-    }
+    let uses = module_edges(&declared);
 
     out_of_order(&uses)
         .into_iter()
@@ -616,10 +639,10 @@ fn package_and_dependencies(manifest: &str) -> (String, BTreeSet<String>) {
                 "[dependencies]" => "dependencies",
                 _ => {
                     // `[dependencies.serde]` is the long form of one entry.
-                    if let Some(rest) = trimmed.strip_prefix("[dependencies.") {
-                        if let Some(key) = rest.strip_suffix(']') {
-                            deps.insert(key.to_owned());
-                        }
+                    if let Some(rest) = trimmed.strip_prefix("[dependencies.")
+                        && let Some(key) = rest.strip_suffix(']')
+                    {
+                        deps.insert(key.to_owned());
                     }
                     ""
                 }
@@ -653,21 +676,13 @@ fn package_and_dependencies(manifest: &str) -> (String, BTreeSet<String>) {
 /// way the arrows point before a single file is opened: in the codebase this
 /// came from, `data-adapters` then `business-logic` then `interfaces` — the
 /// three strata, in the order they stand on each other.
-fn workspace_violations(path: &Path, source: &str) -> Vec<Violation> {
-    if path.file_name().is_none_or(|n| n != "Cargo.toml") {
-        return Vec::new();
-    }
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let members = members_of(dir, source);
-    if members.len() < 2 {
-        return Vec::new();
-    }
-
+/// Which member entry depends on which. Shared with the fixer.
+fn member_edges(members: &[Member]) -> BTreeMap<usize, BTreeSet<usize>> {
     // What each entry PROVIDES, and what it ASKS FOR, pooled per entry — a
     // folder of crates is one node here, which is what makes folders orderable.
     let mut provides: Vec<BTreeSet<String>> = Vec::new();
     let mut wants: Vec<BTreeSet<String>> = Vec::new();
-    for member in &members {
+    for member in members {
         let (mut mine, mut theirs) = (BTreeSet::new(), BTreeSet::new());
         for krate in &member.crates {
             if let Ok(manifest) = std::fs::read_to_string(krate.join("Cargo.toml")) {
@@ -680,13 +695,27 @@ fn workspace_violations(path: &Path, source: &str) -> Vec<Violation> {
         wants.push(theirs);
     }
 
-    let mut uses: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-    for n in 0..members.len() {
+    let mut uses = BTreeMap::new();
+    for (n, mine) in wants.iter().enumerate() {
         let deps = (0..members.len())
-            .filter(|m| *m != n && provides[*m].iter().any(|name| wants[n].contains(name)))
+            .filter(|m| *m != n && provides[*m].iter().any(|name| mine.contains(name)))
             .collect();
         uses.insert(n, deps);
     }
+    uses
+}
+
+fn workspace_violations(path: &Path, source: &str) -> Vec<Violation> {
+    if path.file_name().is_none_or(|n| n != "Cargo.toml") {
+        return Vec::new();
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let members = members_of(dir, source);
+    if members.len() < 2 {
+        return Vec::new();
+    }
+
+    let uses = member_edges(&members);
 
     out_of_order(&uses)
         .into_iter()

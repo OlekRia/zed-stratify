@@ -9,9 +9,11 @@
 //! typing rather than after you save. [`stratify::check_source`] is pure for
 //! exactly that reason; only the sibling-module lookup touches the disk.
 //!
-//! Also runs standalone: `stratify-lsp --check <dir>` prints `file:line:` lines
-//! and exits non-zero if any. That is what CI would call, and what proves the
-//! binary works without an editor in the loop.
+//! Also runs standalone. `stratify-lsp --check <dir>` prints `file:line:` lines
+//! and exits non-zero if any — what CI calls, and what proves the binary works
+//! without an editor in the loop. `stratify-lsp --fix <dir>` repairs what can
+//! be repaired and reports what it left, which is item order: see the fixer's
+//! module docs for why that one is reported and not moved.
 //!
 //! **ACTION** (Normand's sense) — it owns stdio and a document map. Every
 //! decision it makes lives in `stratify`, which is a calculation.
@@ -81,6 +83,21 @@ fn diagnostics(path: &Path, source: &str) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// Replace the buffer wholesale.
+///
+/// The alternative — a minimal diff of moved blocks — is more code for a worse
+/// result: the editor renders one edit as one undo step either way, and a
+/// partial application of a reordering is a file that does not compile.
+fn whole_document(before: &str, after: &str) -> Value {
+    json!({
+        "range": {
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": before.lines().count(), "character": 0 },
+        },
+        "newText": after,
+    })
 }
 
 /// One LSP message, framed. Reads exactly the declared body and no further —
@@ -164,11 +181,41 @@ fn serve() {
                     "result": {
                         "capabilities": {
                             "textDocumentSync": { "openClose": true, "change": 1, "save": true },
+                            // Offered on the whole document rather than per
+                            // diagnostic: reordering a list fixes every
+                            // violation in it at once, and one action that
+                            // leaves the file clean beats six that each move
+                            // one line.
+                            "codeActionProvider": { "codeActionKinds": ["quickfix"] },
                         },
                         "serverInfo": { "name": "stratify", "version": env!("CARGO_PKG_VERSION") },
                     },
                 }),
             ),
+            "textDocument/codeAction" => {
+                let uri = params
+                    .pointer("/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let actions = path_of(uri)
+                    .zip(open.get(uri))
+                    .and_then(|(path, text)| {
+                        stratify::fix_source(&path, text).map(|fixed| (path, text, fixed))
+                    })
+                    .map_or_else(Vec::new, |(path, text, fixed)| {
+                        vec![json!({
+                            "title": "Stratify: order declarations by dependency",
+                            "kind": "quickfix",
+                            "isPreferred": true,
+                            "edit": { "changes": { uri: [whole_document(text, &fixed)] } },
+                            "diagnostics": diagnostics(&path, text),
+                        })]
+                    });
+                write_message(
+                    &mut output,
+                    &json!({ "jsonrpc": "2.0", "id": id, "result": actions }),
+                );
+            }
             "shutdown" => write_message(
                 &mut output,
                 &json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null }),
@@ -207,6 +254,42 @@ fn serve() {
     }
 }
 
+/// Repair every file that can be repaired, and say what was left behind.
+fn fix(root: &Path) -> std::process::ExitCode {
+    let mut files = Vec::new();
+    stratify::source_files(root, &mut files);
+
+    let mut fixed = 0usize;
+    for path in &files {
+        let Ok(source) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if let Some(next) = stratify::fix_source(path, &source)
+            && std::fs::write(path, &next).is_ok()
+        {
+            println!("fixed {}", path.display());
+            fixed += 1;
+        }
+    }
+
+    // Fixing a module list can reveal an item fault that was hiding below a
+    // test module, so the report comes from a FRESH read rather than from
+    // what was known before the edits.
+    let report = stratify::check_tree(root);
+    println!(
+        "{fixed} file(s) fixed, {} left for a human",
+        report.violations.len()
+    );
+    for v in &report.violations {
+        println!("{}:{}: {}", v.file.display(), v.line, v.message());
+    }
+    if report.violations.is_empty() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    }
+}
+
 /// The standalone check, so this binary is testable without an editor.
 fn check(root: &Path) -> std::process::ExitCode {
     let report = stratify::check_tree(root);
@@ -234,6 +317,10 @@ fn main() -> std::process::ExitCode {
         Some((flag, rest)) if flag == "--check" => {
             let root = rest.first().map_or(".", String::as_str);
             check(Path::new(root))
+        }
+        Some((flag, rest)) if flag == "--fix" => {
+            let root = rest.first().map_or(".", String::as_str);
+            fix(Path::new(root))
         }
         _ => {
             serve();

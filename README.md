@@ -109,6 +109,29 @@ blocks a build is a CI job, not an editor.
 If none exist, it says so and names all three. A language server that silently
 fails to start looks exactly like a codebase with nothing wrong in it.
 
+## Fixing
+
+Two ways, one engine:
+
+- **In Zed** — a quickfix code action, *Stratify: order declarations by
+  dependency*, on any file with a violation it can repair.
+- **On the command line** — `stratify-lsp --fix <dir>`.
+
+It reorders **lists**: module declarations, workspace members, and the
+`#[cfg(test)]` block that belongs at the end. Those are whole blocks with
+unambiguous boundaries, and the order it picks is stable — a list that already
+obeys the rule comes back unchanged, and one that does not moves as little as
+it can, so `--fix` is not a different diff every run.
+
+It does **not** reorder items inside a file. An item extent is harder than it
+looks (section comments between declarations, `impl` blocks belonging to a type
+three items away) and a fixer that gets it wrong produces a file that no longer
+parses. Item faults are reported and left for a human.
+
+Every edit is checked to have MOVED lines and not invented, dropped or altered
+any — the multiset of non-blank lines must match. A fix failing that check is
+discarded and the file is left alone. A file with no violation is never touched.
+
 ## Without an editor
 
 The same binary is a one-shot checker, which is what CI should call:
