@@ -37,7 +37,7 @@
 
 mod fix;
 
-pub use fix::{fix_source, numbered_layout};
+pub use fix::fix_source;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -439,11 +439,10 @@ fn declarations_of(dir: &Path, source: &str) -> Vec<Declaration> {
         if n >= cut {
             break;
         }
-        // `#[path = "01_web_product.rs"]` decouples the FILE NAME from the
-        // module name, which is the only way to make a file explorer show the
-        // stratification — explorers sort alphabetically and nothing in an
-        // editor's extension API can change that. Honour it, or a numbered
-        // crate looks dependency-free and every rule here goes quiet.
+        // `#[path = "..."]` decouples the FILE NAME from the module name.
+        // Rare, but a crate that uses it and a checker that ignores it look
+        // exactly like a crate with no dependencies at all — every edge
+        // vanishes and the report comes back a confident clean.
         if let Some(rest) = line.trim_start().strip_prefix("#[path") {
             explicit_path = rest
                 .split('"')
@@ -1109,11 +1108,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Numbering the FILES is the only way to make an explorer show the
-    /// layering — and if the rules stopped following `#[path]`, a numbered
-    /// crate would look dependency-free and report a confident clean.
+    /// A crate using `#[path]` must not read as dependency-free.
     #[test]
-    fn when_a_module_file_is_numbered_then_its_edges_are_still_seen() {
+    fn when_a_module_file_is_renamed_by_a_path_attribute_then_its_edges_are_still_seen() {
         let dir = std::env::temp_dir().join("stratify-path-attr-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");

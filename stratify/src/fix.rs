@@ -27,7 +27,7 @@
 //! A fix that fails that check is discarded and the file is left alone.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::{
     Declaration, Member, declarations_of, member_edges, members_of, module_edges, reachable,
@@ -317,87 +317,6 @@ pub fn fix_source(path: &Path, source: &str) -> Option<String> {
     }
 
     (touched && text != source).then_some(text)
-}
-
-/// **Numbering the files so a file explorer shows the layering.**
-///
-/// No editor can be made to sort a project panel by anything but the
-/// alphabet — Zed's offers `directories_first` / `mixed` / `files_first` and
-/// nothing else, and its extension API has no project-panel hook at any
-/// version. The only lever left is the file NAME, and Rust hands it over:
-/// `#[path = "01_web_product.rs"] mod web_product;` renames the file and
-/// leaves the module path, the imports and `crate::WebProduct` untouched.
-///
-/// The numbers come from the declaration order, so this is re-runnable rather
-/// than hand-maintained: reorder the list, run it again, the numbers follow.
-///
-/// Returns the rewritten `mod.rs`/`lib.rs` and the renames to perform. An
-/// empty rename list means the numbering was already right.
-#[must_use]
-pub fn numbered_layout(path: &Path, source: &str) -> Option<(String, Vec<(PathBuf, PathBuf)>)> {
-    if path
-        .file_name()
-        .is_none_or(|n| n != "mod.rs" && n != "lib.rs")
-    {
-        return None;
-    }
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let declared = declarations_of(dir, source);
-    if declared.len() < 2 {
-        return None;
-    }
-
-    let lines: Vec<&str> = source.lines().collect();
-    let mut out: Vec<String> = Vec::with_capacity(lines.len() + declared.len());
-    let mut renames = Vec::new();
-    let mut heads: BTreeMap<usize, (String, String)> = BTreeMap::new();
-
-    for (slot, decl) in declared.iter().enumerate() {
-        // The name the file should have, and what it has now. A directory
-        // module is `NN_name/mod.rs`; a file module is `NN_name.rs`.
-        let stem = format!("{:02}_{}", slot + 1, decl.name);
-        let (current_file, current_dir) = (dir.join(format!("{}.rs", decl.name)), dir.join(&decl.name));
-        let (from, to, attr) = if current_dir.is_dir() || dir.join(&stem).is_dir() {
-            (current_dir, dir.join(&stem), format!("{stem}/mod.rs"))
-        } else {
-            (current_file, dir.join(format!("{stem}.rs")), format!("{stem}.rs"))
-        };
-        // Whatever it is called today, including an existing number.
-        let existing = existing_path(&lines, decl.line - 1);
-        let from = existing.map_or(from, |p| dir.join(p.trim_end_matches("/mod.rs")));
-        if from != to && from.exists() {
-            renames.push((from, to));
-        }
-        heads.insert(decl.line - 1, (attr, decl.name.clone()));
-    }
-
-    let mut n = 0;
-    while n < lines.len() {
-        // Drop any `#[path]` already there; it is about to be rewritten.
-        if lines[n].trim_start().starts_with("#[path") && heads.contains_key(&(n + 1)) {
-            n += 1;
-            continue;
-        }
-        if let Some((attr, _)) = heads.get(&n) {
-            out.push(format!("#[path = \"{attr}\"]"));
-        }
-        out.push(lines[n].to_owned());
-        n += 1;
-    }
-
-    let text = out.join("\n") + "\n";
-    (text != source || !renames.is_empty()).then_some((text, renames))
-}
-
-/// The `#[path = "..."]` already sitting above this declaration, if any.
-fn existing_path(lines: &[&str], head: usize) -> Option<String> {
-    lines[..head]
-        .iter()
-        .rev()
-        .take_while(|l| l.trim_start().starts_with("#["))
-        .find_map(|l| l.trim_start().strip_prefix("#[path"))
-        .and_then(|rest| rest.split('"').nth(1))
-        .map(str::to_owned)
 }
 
 #[cfg(test)]
