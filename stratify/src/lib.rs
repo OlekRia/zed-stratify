@@ -225,6 +225,25 @@ fn item_name(line: &str) -> Option<(&'static str, String)> {
     None
 }
 
+/// The names a module makes public, at column zero.
+///
+/// Needed because of `pub use X::*;`. A crate that re-exports its modules with
+/// a glob lets a sibling write `use crate::WebProduct` — naming the ITEM and
+/// never the module — so the textual `web_product::` search finds nothing and
+/// every edge in such a crate was invisible. That was most of them.
+fn public_names(source: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for line in source.lines() {
+        if !line.starts_with("pub ") {
+            continue;
+        }
+        if let Some((_, name)) = item_name(line) {
+            out.insert(name);
+        }
+    }
+    out
+}
+
 /// The name in `mod X {`, if this line opens an inline module at column zero.
 fn inline_module_name(line: &str) -> Option<String> {
     let mut rest = line;
@@ -383,6 +402,9 @@ struct Declaration {
     name: String,
     line: usize,
     owned: String,
+    /// The names this module makes public — what a `pub use X::*;` in the
+    /// parent puts within reach of every sibling as plain `crate::Name`.
+    exports: BTreeSet<String>,
 }
 
 /// Every `mod X;` in a `mod.rs` or `lib.rs`, with the source behind it.
@@ -416,10 +438,12 @@ fn declarations_of(dir: &Path, source: &str) -> Vec<Declaration> {
                 }
             }
         }
+        let exports = public_names(&owned);
         out.push(Declaration {
             name,
             line: n + 1,
             owned,
+            exports,
         });
     }
     out
@@ -441,16 +465,28 @@ fn names_path(body: &str, ident: &str) -> bool {
     })
 }
 
-/// Does this module's source reach for that sibling?
-fn reaches_for(source: &str, sibling: &str) -> bool {
-    if names_path(source, sibling) {
+/// Does this module's source reach for that sibling — by name, or by using
+/// something the sibling exports through the parent's `pub use X::*;`?
+fn reaches_for(source: &str, sibling: &Declaration) -> bool {
+    if names_path(source, &sibling.name) {
         return true;
     }
     // `use super::{a, b};` names a sibling without a following `::`.
-    source
+    let by_name = source
         .lines()
         .filter(|l| l.trim_start().starts_with("use ") && l.contains('{'))
-        .any(|l| names(l, sibling))
+        .any(|l| names(l, &sibling.name));
+    if by_name {
+        return true;
+    }
+    // `use crate::WebProduct;` — the glob-re-export case. Only `use` lines are
+    // read: a struct FIELD of that type is a use of the type, but the import
+    // that brought it in is on a line of its own and is what this looks for.
+    source
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| l.starts_with("use crate::") || l.starts_with("use super::"))
+        .any(|l| sibling.exports.iter().any(|item| names(l, item)))
 }
 
 /// Modules declared above a sibling they use.
@@ -471,7 +507,7 @@ fn module_violations(path: &Path, source: &str) -> Vec<Violation> {
     for (n, decl) in declared.iter().enumerate() {
         let mut deps = BTreeSet::new();
         for (m, other) in declared.iter().enumerate() {
-            if m != n && reaches_for(&decl.owned, &other.name) {
+            if m != n && reaches_for(&decl.owned, other) {
                 deps.insert(m);
             }
         }
@@ -995,6 +1031,32 @@ mod tests {
         let found = at("fn a() {}\n#[cfg(test)]\nmod tests {}\nmod helpers;\n");
         assert_eq!(found.len(), 1, "{found:#?}");
         assert_eq!(found[0].name, "helpers");
+    }
+
+    /// The case that made the rule blind in most real crates: a parent that
+    /// re-exports with `pub use X::*;`, so siblings name the ITEM, never the
+    /// module.
+    #[test]
+    fn when_a_sibling_is_reached_through_a_glob_re_export_then_the_edge_is_seen() {
+        let dir = std::env::temp_dir().join("stratify-glob-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("uses_it.rs"), "use crate::WebProduct;\npub fn go(_: WebProduct) {}\n")
+            .expect("write");
+        std::fs::write(dir.join("web_product.rs"), "pub struct WebProduct;\n").expect("write");
+
+        let bad = "mod uses_it;\npub use uses_it::*;\n\nmod web_product;\npub use web_product::*;\n";
+        std::fs::write(dir.join("lib.rs"), bad).expect("write");
+        let found = check_file(&dir.join("lib.rs"));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].name, "uses_it");
+        assert_eq!(found[0].uses, "web_product");
+
+        let good = "mod web_product;\npub use web_product::*;\n\nmod uses_it;\npub use uses_it::*;\n";
+        std::fs::write(dir.join("lib.rs"), good).expect("write");
+        assert!(check_file(&dir.join("lib.rs")).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Independent siblings may sit in any order — the discovery that came from
