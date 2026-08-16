@@ -6,12 +6,26 @@ F# lists its files in build order and forbids forward references, so the project
 file *is* the architecture. Rust does not care, which leaves the order of a
 `mod.rs` free to say something — and what it should say is the layering.
 
-Two rules, one idea, at two scales:
+Three rules, one idea, at three scales:
 
 | rule | code | what it says |
 |---|---|---|
 | item order | `stratify/item-order` | inside a file, an item is defined **below** everything it uses |
 | module order | `stratify/module-order` | inside a `mod.rs`/`lib.rs`, a module is declared **below** every sibling it reaches for |
+| member order | `stratify/member-order` | inside a `Cargo.toml`, a workspace member is listed **below** every member it depends on |
+
+The third one orders **folders**: `crates/data-adapters/*` is one entry naming a
+directory of crates, so a glob is expanded rather than rejected. A `members`
+list is the first thing anyone reads about a repository, and in dependency order
+it says which way the arrows point before a single file is opened:
+
+```toml
+members = [
+    "crates/business-logic/*",   # depends on neither of the others
+    "crates/data-adapters/*",    # reaches business-logic for domain types
+    "crates/interfaces/*",       # sees everything
+]
+```
 
 So a file reads downward — by the time you reach a function, everything it calls
 is already behind you — and a handler file *ends* with its `handler` rather than
@@ -27,7 +41,7 @@ layering, in nine lines. It used to be alphabetical, which said nothing.
 
 | | |
 |---|---|
-| `stratify/` | the rules, as a dependency-free library |
+| `stratify/` | the three rules, as a dependency-free library |
 | `stratify-lsp/` | a language server publishing them as diagnostics, plus `--check` for CI |
 | `src/lib.rs` | the Zed extension, whose only job is to launch that server |
 
@@ -82,9 +96,9 @@ fails to start looks exactly like a codebase with nothing wrong in it.
 The same binary is a one-shot checker, which is what CI should call:
 
 ```sh
-stratify-lsp --check ./crates
+stratify-lsp --check .
 # crates/…/mod.rs:8: `mod state` uses `semantic`, declared below it (line 12)
-# 1 violation(s) — 221 files, 116 ordered, 27 module lists
+# 2 violation(s) — 235 files, 116 ordered, 27 module lists, 1 workspaces
 ```
 
 Non-zero exit when anything is out of order. The counts are not decoration: a

@@ -45,6 +45,8 @@ pub enum Rule {
     Item,
     /// A module declared above a sibling it uses.
     Module,
+    /// A workspace member listed above one it depends on.
+    Workspace,
 }
 
 impl Rule {
@@ -54,6 +56,7 @@ impl Rule {
         match self {
             Self::Item => "stratify/item-order",
             Self::Module => "stratify/module-order",
+            Self::Workspace => "stratify/member-order",
         }
     }
 }
@@ -83,6 +86,10 @@ impl Violation {
             ),
             Rule::Module => format!(
                 "`mod {}` uses `{}`, declared below it (line {})",
+                self.name, self.uses, self.uses_line
+            ),
+            Rule::Workspace => format!(
+                "member `{}` depends on `{}`, listed below it (line {})",
                 self.name, self.uses, self.uses_line
             ),
         }
@@ -206,7 +213,10 @@ fn item_name(line: &str) -> Option<(&'static str, String)> {
 }
 
 /// A top-level item: its name, the line it is announced on, and what it spans.
-struct Item {
+///
+/// NOT `Item`: that reads as `Rule::Item` to anyone skimming, and to the rule
+/// this crate enforces — which is how the name got changed.
+struct TopLevelItem {
     name: String,
     head: usize,
     from: usize,
@@ -214,7 +224,7 @@ struct Item {
 }
 
 /// The file's top-level items, or `None` when the rule does not apply to it.
-fn items_of(source: &str) -> Option<Vec<Item>> {
+fn items_of(source: &str) -> Option<Vec<TopLevelItem>> {
     let all: Vec<&str> = source.lines().collect();
     let cut = tests_begin(source).min(all.len());
 
@@ -251,7 +261,7 @@ fn items_of(source: &str) -> Option<Vec<Item>> {
     let starts: Vec<usize> = heads.iter().map(|(_, n)| start_of(*n)).collect();
     let mut out = Vec::new();
     for (i, (name, head)) in heads.iter().enumerate() {
-        out.push(Item {
+        out.push(TopLevelItem {
             name: name.clone(),
             head: *head,
             from: starts[i],
@@ -291,6 +301,29 @@ fn item_violations(path: &Path, source: &str) -> Vec<Violation> {
             uses_line: items[b].head + 1,
         })
         .collect()
+}
+
+/// Every `.rs` file and every `Cargo.toml` under a directory.
+///
+/// `target/` and dotted directories are skipped: build output contains
+/// generated Rust nobody wrote and vendored manifests nobody owns, and
+/// reporting a layout convention against either is noise.
+pub fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut found: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    found.sort(); // so a report reads the same twice
+    for path in found {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if path.is_dir() {
+            if name != "target" && !name.starts_with('.') {
+                source_files(&path, out);
+            }
+        } else if path.extension().is_some_and(|e| e == "rs") || name == "Cargo.toml" {
+            out.push(path);
+        }
+    }
 }
 
 /// A `mod X;` declaration: the name, where it is declared, and the source that
@@ -337,7 +370,7 @@ fn declarations_of(dir: &Path, source: &str) -> Vec<Declaration> {
         let sub = dir.join(&name);
         if sub.is_dir() {
             let mut files = Vec::new();
-            rust_files(&sub, &mut files);
+            source_files(&sub, &mut files);
             for f in files {
                 if let Ok(text) = std::fs::read_to_string(f) {
                     owned.push('\n');
@@ -420,12 +453,187 @@ fn module_violations(path: &Path, source: &str) -> Vec<Violation> {
         .collect()
 }
 
-/// **Both rules against one file's text.** The editor calls this on the buffer
+/// A workspace member entry: the text as written, where, and the crates it
+/// resolves to. `crates/data-adapters/*` is ONE entry naming a FOLDER, which is
+/// why a glob is expanded rather than rejected — ordering the folders is the
+/// point at this scale.
+struct Member {
+    entry: String,
+    line: usize,
+    crates: Vec<PathBuf>,
+}
+
+/// The quoted entries of a `members = [...]` list, with their line numbers.
+///
+/// Line-based, like the rest of this crate. A TOML parser would be better and
+/// is not worth a dependency for a layout convention — and this crate having no
+/// dependencies is what lets a test and an editor share it without argument.
+fn members_of(dir: &Path, source: &str) -> Vec<Member> {
+    let mut inside = false;
+    let mut out = Vec::new();
+
+    for (n, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        // `default-members` is a different list with a different job.
+        if !inside {
+            let head = trimmed.replace(' ', "");
+            if head.starts_with("members=[") {
+                inside = true;
+            } else {
+                continue;
+            }
+        }
+        for chunk in trimmed.split('"').skip(1).step_by(2) {
+            let mut crates = Vec::new();
+            match chunk.strip_suffix("/*") {
+                Some(folder) => {
+                    let mut found: Vec<PathBuf> = std::fs::read_dir(dir.join(folder))
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.join("Cargo.toml").is_file())
+                        .collect();
+                    found.sort();
+                    crates.extend(found);
+                }
+                None => {
+                    let one = dir.join(chunk);
+                    if one.join("Cargo.toml").is_file() {
+                        crates.push(one);
+                    }
+                }
+            }
+            out.push(Member {
+                entry: chunk.to_owned(),
+                line: n + 1,
+                crates,
+            });
+        }
+        if trimmed.contains(']') {
+            break;
+        }
+    }
+    out
+}
+
+/// A manifest's `name`, and the packages it depends on in production.
+///
+/// `[dev-dependencies]` are NOT read. A test reaching sideways for a fixture
+/// crate says nothing about which layer stands on which, and treating it as
+/// architecture is how a layering rule starts reporting cycles that are not
+/// there.
+fn package_and_dependencies(manifest: &str) -> (String, BTreeSet<String>) {
+    let mut name = String::new();
+    let mut deps = BTreeSet::new();
+    let mut section = "";
+
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            section = match trimmed {
+                "[package]" => "package",
+                "[dependencies]" => "dependencies",
+                _ => {
+                    // `[dependencies.serde]` is the long form of one entry.
+                    if let Some(rest) = trimmed.strip_prefix("[dependencies.") {
+                        if let Some(key) = rest.strip_suffix(']') {
+                            deps.insert(key.to_owned());
+                        }
+                    }
+                    ""
+                }
+            };
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        match section {
+            "package" if key == "name" => name = value.trim().trim_matches('"').to_owned(),
+            "dependencies" => {
+                // `mcg-search-index.workspace = true` is ONE dependency whose
+                // key carries a sub-field. Keeping the whole key made every
+                // workspace-inherited dependency invisible, and the rule
+                // reported a confident zero on a workspace listed upside down.
+                deps.insert(key.split('.').next().unwrap_or(key).to_owned());
+            }
+            _ => {}
+        }
+    }
+    (name, deps)
+}
+
+/// **THE SAME RULE AT THE WIDEST SCALE: workspace members are LISTED in
+/// dependency order**, folders included.
+///
+/// A `members` list is the first thing anyone reads about a repository, and
+/// alphabetical order tells them nothing. In dependency order it says which
+/// way the arrows point before a single file is opened: in the codebase this
+/// came from, `data-adapters` then `business-logic` then `interfaces` — the
+/// three strata, in the order they stand on each other.
+fn workspace_violations(path: &Path, source: &str) -> Vec<Violation> {
+    if path.file_name().is_none_or(|n| n != "Cargo.toml") {
+        return Vec::new();
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let members = members_of(dir, source);
+    if members.len() < 2 {
+        return Vec::new();
+    }
+
+    // What each entry PROVIDES, and what it ASKS FOR, pooled per entry — a
+    // folder of crates is one node here, which is what makes folders orderable.
+    let mut provides: Vec<BTreeSet<String>> = Vec::new();
+    let mut wants: Vec<BTreeSet<String>> = Vec::new();
+    for member in &members {
+        let (mut mine, mut theirs) = (BTreeSet::new(), BTreeSet::new());
+        for krate in &member.crates {
+            if let Ok(manifest) = std::fs::read_to_string(krate.join("Cargo.toml")) {
+                let (name, deps) = package_and_dependencies(&manifest);
+                mine.insert(name);
+                theirs.extend(deps);
+            }
+        }
+        provides.push(mine);
+        wants.push(theirs);
+    }
+
+    let mut uses: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    for n in 0..members.len() {
+        let deps = (0..members.len())
+            .filter(|m| *m != n && provides[*m].iter().any(|name| wants[n].contains(name)))
+            .collect();
+        uses.insert(n, deps);
+    }
+
+    out_of_order(&uses)
+        .into_iter()
+        .map(|(a, b)| Violation {
+            rule: Rule::Workspace,
+            file: path.to_path_buf(),
+            line: members[a].line,
+            name: members[a].entry.clone(),
+            uses: members[b].entry.clone(),
+            uses_line: members[b].line,
+        })
+        .collect()
+}
+
+/// **Every rule against one file's text.** The editor calls this on the buffer
 /// as you type, so it must not assume the text has been saved.
 #[must_use]
 pub fn check_source(path: &Path, source: &str) -> Vec<Violation> {
     let mut out = item_violations(path, source);
     out.extend(module_violations(path, source));
+    out.extend(workspace_violations(path, source));
     out
 }
 
@@ -433,22 +641,6 @@ pub fn check_source(path: &Path, source: &str) -> Vec<Violation> {
 #[must_use]
 pub fn check_file(path: &Path) -> Vec<Violation> {
     std::fs::read_to_string(path).map_or_else(|_| Vec::new(), |s| check_source(path, &s))
-}
-
-/// Every `.rs` file under a directory.
-pub fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut found: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    found.sort(); // so a report reads the same twice
-    for path in found {
-        if path.is_dir() {
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
 }
 
 /// What a whole-tree run found, and HOW MUCH IT LOOKED AT.
@@ -462,6 +654,8 @@ pub struct Report {
     pub files_checked: usize,
     /// `mod.rs`/`lib.rs` files with two or more declarations.
     pub lists_checked: usize,
+    /// Manifests with a `members` list of two or more entries.
+    pub workspaces_checked: usize,
     pub files_seen: usize,
 }
 
@@ -469,7 +663,7 @@ pub struct Report {
 #[must_use]
 pub fn check_tree(root: &Path) -> Report {
     let mut files = Vec::new();
-    rust_files(root, &mut files);
+    source_files(root, &mut files);
 
     let mut report = Report {
         files_seen: files.len(),
@@ -479,7 +673,7 @@ pub fn check_tree(root: &Path) -> Report {
         let Ok(source) = std::fs::read_to_string(path) else {
             continue;
         };
-        if items_of(&source).is_some() {
+        if path.extension().is_some_and(|e| e == "rs") && items_of(&source).is_some() {
             report.files_checked += 1;
             report.violations.extend(item_violations(path, &source));
         }
@@ -491,6 +685,11 @@ pub fn check_tree(root: &Path) -> Report {
         {
             report.lists_checked += 1;
             report.violations.extend(module_violations(path, &source));
+        }
+        if path.file_name().is_some_and(|n| n == "Cargo.toml") && members_of(dir, &source).len() >= 2
+        {
+            report.workspaces_checked += 1;
+            report.violations.extend(workspace_violations(path, &source));
         }
     }
     report
@@ -577,6 +776,50 @@ mod tests {
         assert!(check_file(&dir.join("mod.rs")).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The widest scale, and the one the user asked for by name: FOLDERS of a
+    /// workspace, ordered by which stands on which.
+    #[test]
+    fn when_a_workspace_member_is_listed_above_one_it_depends_on_then_that_is_a_violation() {
+        let dir = std::env::temp_dir().join("stratify-workspace-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        for (folder, manifest) in [
+            ("layers/top/app", "[package]\nname = \"app\"\n\n[dependencies]\nbase = { path = \"../../bottom/base\" }\n"),
+            ("layers/bottom/base", "[package]\nname = \"base\"\n"),
+        ] {
+            std::fs::create_dir_all(dir.join(folder)).expect("dirs");
+            std::fs::write(dir.join(folder).join("Cargo.toml"), manifest).expect("manifest");
+        }
+
+        let bad = "[workspace]\nmembers = [\n  \"layers/top/*\",\n  \"layers/bottom/*\",\n]\n";
+        // NB the fixture above writes `base = { path = ... }`; the inherited
+        // spelling is covered by its own test below.
+        std::fs::write(dir.join("Cargo.toml"), bad).expect("write");
+        let found = check_file(&dir.join("Cargo.toml"));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].rule, Rule::Workspace);
+        assert_eq!(found[0].name, "layers/top/*");
+        assert_eq!(found[0].uses, "layers/bottom/*");
+        assert_eq!(found[0].line, 3, "the offending entry's own line");
+
+        let good = "[workspace]\nmembers = [\n  \"layers/bottom/*\",\n  \"layers/top/*\",\n]\n";
+        std::fs::write(dir.join("Cargo.toml"), good).expect("write");
+        assert!(check_file(&dir.join("Cargo.toml")).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `dep.workspace = true` is the spelling this whole workspace uses, and
+    /// reading it as a key called `dep.workspace` hid every edge there was.
+    #[test]
+    fn when_a_dependency_is_inherited_from_the_workspace_then_it_is_still_a_dependency() {
+        let (name, deps) = package_and_dependencies(
+            "[package]\nname = \"app\"\n\n[dependencies]\nmcg-search-index.workspace = true\nreqwest = { version = \"0.13\" }\n",
+        );
+        assert_eq!(name, "app");
+        assert!(deps.contains("mcg-search-index"), "{deps:?}");
+        assert!(deps.contains("reqwest"), "{deps:?}");
     }
 
     /// Independent siblings may sit in any order — the discovery that came from

@@ -9,10 +9,11 @@ repository = "https://github.com/OlekRia/zed-stratify"
 # Zed extensions cannot publish diagnostics. An extension may LAUNCH a language
 # server, and the server is what marks up a buffer — so everything this
 # extension does is find `stratify-lsp` and start it.
+# BOTH languages. The item and module rules are about Rust files; the member
+# rule is about a Cargo.toml, and a server that never sees one cannot report it.
 [language_servers.stratify]
 name = "Stratify"
-language = "Rust"
-languages = []
+languages = ["Rust", "TOML"]
 
 # Zed 1.x gates an extension's right to run a binary. Without this the launch
 # is refused and the server simply never starts — which looks exactly like a

@@ -214,11 +214,12 @@ fn check(root: &Path) -> std::process::ExitCode {
         println!("{}:{}: {}", v.file.display(), v.line, v.message());
     }
     println!(
-        "{} violation(s) — {} files, {} ordered, {} module lists",
+        "{} violation(s) — {} files, {} ordered, {} module lists, {} workspaces",
         report.violations.len(),
         report.files_seen,
         report.files_checked,
         report.lists_checked,
+        report.workspaces_checked,
     );
     if report.violations.is_empty() {
         std::process::ExitCode::SUCCESS

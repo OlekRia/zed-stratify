@@ -1,0 +1,12 @@
+# DO NOT DROP THIS. rustfmt sorts contiguous `mod` blocks ALPHABETICALLY by
+# default, and this workspace declares modules in DEPENDENCY order — the floor
+# first, whatever sees everything last, so a `mod.rs` reads as the layering
+# rather than as a dictionary. One `cargo fmt --all` with the default on
+# produced 32 violations of the rule the gate enforces.
+#
+# `tests/definition_order.rs` catches it afterwards. This stops it happening.
+reorder_modules = false
+
+# Same reasoning one level down. Import groups here are arranged std / external
+# / crate-local by hand, and that grouping is information too.
+reorder_imports = true
