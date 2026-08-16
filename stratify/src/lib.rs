@@ -47,6 +47,8 @@ pub enum Rule {
     Module,
     /// A workspace member listed above one it depends on.
     Workspace,
+    /// Code after the `#[cfg(test)]` module instead of before it.
+    Tests,
 }
 
 impl Rule {
@@ -57,6 +59,7 @@ impl Rule {
             Self::Item => "stratify/item-order",
             Self::Module => "stratify/module-order",
             Self::Workspace => "stratify/member-order",
+            Self::Tests => "stratify/tests-last",
         }
     }
 }
@@ -91,6 +94,11 @@ impl Violation {
             Rule::Workspace => format!(
                 "member `{}` depends on `{}`, listed below it (line {})",
                 self.name, self.uses, self.uses_line
+            ),
+            Rule::Tests => format!(
+                "`{}` is declared after the `#[cfg(test)]` module (line {}) — \
+                 tests come last",
+                self.name, self.uses_line
             ),
         }
     }
@@ -134,11 +142,16 @@ fn out_of_order(uses: &BTreeMap<usize, BTreeSet<usize>>) -> Vec<(usize, usize)> 
     out
 }
 
-/// Where a `#[cfg(test)]` module starts, which is where both rules stop.
+/// Where the file's OWN `#[cfg(test)]` region starts — where the rules stop.
+///
+/// COLUMN ZERO ONLY. An indented `#[cfg(test)]` is a test module nested inside
+/// some other item, and reading it as the file's boundary had two costs: the
+/// item rule stopped checking two thirds of the file, and everything below it
+/// was reported as a stowaway. Both were found in one real file.
 fn tests_begin(source: &str) -> usize {
     source
         .lines()
-        .position(|l| l.trim_start().starts_with("#[cfg(test)]"))
+        .position(|l| l.starts_with("#[cfg(test)]"))
         .unwrap_or(usize::MAX)
 }
 
@@ -210,6 +223,44 @@ fn item_name(line: &str) -> Option<(&'static str, String)> {
         }
     }
     None
+}
+
+/// The name in `mod X {`, if this line opens an inline module at column zero.
+fn inline_module_name(line: &str) -> Option<String> {
+    let mut rest = line;
+    for lead in ["pub(crate) ", "pub(super) ", "pub "] {
+        if let Some(r) = rest.strip_prefix(lead) {
+            rest = r;
+        }
+    }
+    let after = rest.strip_prefix("mod ")?;
+    let name: String = after
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() || !after[name.len()..].trim_start().starts_with('{') {
+        return None;
+    }
+    Some(name)
+}
+
+/// The name in `mod X;`, if this line is one. At column zero only.
+fn declared_module_name(line: &str) -> Option<String> {
+    let mut rest = line;
+    for lead in ["pub(crate) ", "pub(super) ", "pub "] {
+        if let Some(r) = rest.strip_prefix(lead) {
+            rest = r;
+        }
+    }
+    let after = rest.strip_prefix("mod ")?;
+    let name: String = after
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() || !after[name.len()..].trim_start().starts_with(';') {
+        return None;
+    }
+    Some(name)
 }
 
 /// A top-level item: its name, the line it is announced on, and what it spans.
@@ -346,22 +397,9 @@ fn declarations_of(dir: &Path, source: &str) -> Vec<Declaration> {
         if n >= cut {
             break;
         }
-        let mut rest = line;
-        for lead in ["pub(crate) ", "pub(super) ", "pub "] {
-            if let Some(r) = rest.strip_prefix(lead) {
-                rest = r;
-            }
-        }
-        let Some(after) = rest.strip_prefix("mod ") else {
+        let Some(name) = declared_module_name(line) else {
             continue;
         };
-        let name: String = after
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        if name.is_empty() || !after[name.len()..].trim_start().starts_with(';') {
-            continue;
-        }
 
         let mut owned = String::new();
         if let Ok(text) = std::fs::read_to_string(dir.join(format!("{name}.rs"))) {
@@ -627,6 +665,70 @@ fn workspace_violations(path: &Path, source: &str) -> Vec<Violation> {
         .collect()
 }
 
+/// **TESTS COME LAST, AND NOTHING FOLLOWS THEM.**
+///
+/// The three rules above all stop at `#[cfg(test)]`, because a test module
+/// legitimately reaches for everything above it and ordering it against the
+/// code would make every file a violation. That exemption is only honest if
+/// the module really is the end of the file — otherwise code hides below it,
+/// unordered and unchecked, in the one region nothing looks at.
+///
+/// So this is the rule that makes the other three mean what they say.
+fn tests_last_violations(path: &Path, source: &str) -> Vec<Violation> {
+    if path.extension().is_none_or(|e| e != "rs") {
+        return Vec::new();
+    }
+    let begins = tests_begin(source);
+    if begins == usize::MAX {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    // TRUE, not false: the scan starts one line PAST the `#[cfg(test)]` that
+    // `tests_begin` found, so the item directly beneath it would otherwise be
+    // read as the first stowaway — which is exactly what it is not.
+    let mut gated = true;
+    for (n, line) in source.lines().enumerate().skip(begins + 1) {
+        // What the rule actually forbids is PRODUCTION code below the tests.
+        // A second `#[cfg(test)]` item — another test module, or a helper that
+        // only exists for tests — is still the test region, and moving it
+        // above the first one would be worse rather than better.
+        if line.trim_start().starts_with("#[cfg(test)]") {
+            gated = true;
+            continue;
+        }
+        // Only column zero: everything INSIDE the test module is indented, and
+        // a nested item there is the test module's business, not this rule's.
+        //
+        // `mod tests {` counts here even though the other rules ignore inline
+        // modules. It has to: it is what CONSUMES the `#[cfg(test)]` above it,
+        // and missing it let the gate fall through onto the next item — which
+        // is how a stowaway two lines below the tests read as legitimate.
+        let name = match item_name(line) {
+            Some((_, name)) => name,
+            None => declared_module_name(line)
+                .or_else(|| inline_module_name(line))
+                .unwrap_or_default(),
+        };
+        if name.is_empty() {
+            continue;
+        }
+        if gated {
+            gated = false;
+            continue;
+        }
+        out.push(Violation {
+            rule: Rule::Tests,
+            file: path.to_path_buf(),
+            line: n + 1,
+            name,
+            uses: "#[cfg(test)]".to_owned(),
+            uses_line: begins + 1,
+        });
+    }
+    out
+}
+
 /// **Every rule against one file's text.** The editor calls this on the buffer
 /// as you type, so it must not assume the text has been saved.
 #[must_use]
@@ -634,6 +736,7 @@ pub fn check_source(path: &Path, source: &str) -> Vec<Violation> {
     let mut out = item_violations(path, source);
     out.extend(module_violations(path, source));
     out.extend(workspace_violations(path, source));
+    out.extend(tests_last_violations(path, source));
     out
 }
 
@@ -659,7 +762,12 @@ pub struct Report {
     pub files_seen: usize,
 }
 
-/// Both rules across a tree — what the test and a whole-project run use.
+/// Every rule across a tree — what a test and a whole-project run use.
+///
+/// It calls [`check_source`] rather than the rules directly. It used to name
+/// them one by one, and a fourth rule added to `check_source` alone was then
+/// live in the editor and silent in CI for exactly as long as it took to
+/// notice — the two paths must not be able to drift.
 #[must_use]
 pub fn check_tree(root: &Path) -> Report {
     let mut files = Vec::new();
@@ -673,23 +781,25 @@ pub fn check_tree(root: &Path) -> Report {
         let Ok(source) = std::fs::read_to_string(path) else {
             continue;
         };
-        if path.extension().is_some_and(|e| e == "rs") && items_of(&source).is_some() {
-            report.files_checked += 1;
-            report.violations.extend(item_violations(path, &source));
-        }
+        report.violations.extend(check_source(path, &source));
+
+        // The counts say how much was actually looked at, per scale.
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        if path
-            .file_name()
-            .is_some_and(|n| n == "mod.rs" || n == "lib.rs")
+        let rust = path.extension().is_some_and(|e| e == "rs");
+        if rust && items_of(&source).is_some() {
+            report.files_checked += 1;
+        }
+        if rust
+            && path
+                .file_name()
+                .is_some_and(|n| n == "mod.rs" || n == "lib.rs")
             && declarations_of(dir, &source).len() >= 2
         {
             report.lists_checked += 1;
-            report.violations.extend(module_violations(path, &source));
         }
         if path.file_name().is_some_and(|n| n == "Cargo.toml") && members_of(dir, &source).len() >= 2
         {
             report.workspaces_checked += 1;
-            report.violations.extend(workspace_violations(path, &source));
         }
     }
     report
@@ -820,6 +930,71 @@ mod tests {
         assert_eq!(name, "app");
         assert!(deps.contains("mcg-search-index"), "{deps:?}");
         assert!(deps.contains("reqwest"), "{deps:?}");
+    }
+
+    /// The rule that makes the other three honest: they all stop at
+    /// `#[cfg(test)]`, so anything below it is in a region nothing checks.
+    #[test]
+    fn when_code_follows_the_test_module_then_that_is_a_violation() {
+        let found = at("fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nfn stowaway() {}\n");
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].rule, Rule::Tests);
+        assert_eq!(found[0].name, "stowaway");
+        assert_eq!(found[0].line, 6);
+        assert_eq!(found[0].uses_line, 2, "and it points at the test module");
+    }
+
+    /// A second test module below the first is still the test region.
+    #[test]
+    fn when_what_follows_the_tests_is_itself_cfg_test_then_it_is_not_a_stowaway() {
+        assert!(
+            at("fn a() {}\n#[cfg(test)]\nmod tests {}\n\n#[cfg(test)]\nmod more_tests;\n\n#[cfg(test)]\nfn helper() {}\n")
+                .is_empty()
+        );
+    }
+
+    /// A test module nested inside another item is not the file's boundary.
+    #[test]
+    fn when_a_nested_test_module_appears_then_the_file_keeps_being_checked() {
+        let source = concat!(
+            "mod inner {\n",
+            "    #[cfg(test)]\n",
+            "    mod tests {}\n",
+            "}\n",
+            "fn top() { helper(); }\n",
+            "fn helper() {}\n",
+        );
+        let found = at(source);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].rule, Rule::Item, "an ordering fault, not a stowaway");
+        assert_eq!(found[0].name, "top");
+    }
+
+    /// The off-by-one: the item directly under the first `#[cfg(test)]`.
+    #[test]
+    fn when_a_test_only_function_sits_directly_below_the_marker_then_it_is_fine() {
+        assert!(at("fn a() {}\n#[cfg(test)]\npub fn only_for_tests() {}\n").is_empty());
+    }
+
+    #[test]
+    fn when_the_test_module_really_is_last_then_nothing_is_reported() {
+        assert!(at("fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() { a(); }\n}\n").is_empty());
+    }
+
+    /// Items INSIDE the test module are indented, and are its own business.
+    #[test]
+    fn when_the_test_module_declares_its_own_items_then_they_are_not_stowaways() {
+        assert!(
+            at("fn a() {}\n#[cfg(test)]\nmod tests {\n    use super::*;\n    struct Fixture;\n    fn t() {}\n}\n")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn when_a_module_is_declared_after_the_tests_then_that_is_a_violation_too() {
+        let found = at("fn a() {}\n#[cfg(test)]\nmod tests {}\nmod helpers;\n");
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].name, "helpers");
     }
 
     /// Independent siblings may sit in any order — the discovery that came from

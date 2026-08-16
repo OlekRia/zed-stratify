@@ -6,13 +6,14 @@ F# lists its files in build order and forbids forward references, so the project
 file *is* the architecture. Rust does not care, which leaves the order of a
 `mod.rs` free to say something — and what it should say is the layering.
 
-Three rules, one idea, at three scales:
+Four rules, one idea, at three scales — plus the one that makes them honest:
 
 | rule | code | what it says |
 |---|---|---|
 | item order | `stratify/item-order` | inside a file, an item is defined **below** everything it uses |
 | module order | `stratify/module-order` | inside a `mod.rs`/`lib.rs`, a module is declared **below** every sibling it reaches for |
 | member order | `stratify/member-order` | inside a `Cargo.toml`, a workspace member is listed **below** every member it depends on |
+| tests last | `stratify/tests-last` | nothing follows the `#[cfg(test)]` module |
 
 The third one orders **folders**: `crates/data-adapters/*` is one entry naming a
 directory of crates, so a glob is expanded rather than rejected. A `members`
@@ -56,6 +57,23 @@ Mutual dependencies are **vacuous, not violated** — `AppState` holding a
 the rule says nothing rather than nagging. That clause is what keeps this a rule
 instead of a description with exceptions.
 
+### Why `tests last` is a rule and not a nicety
+
+The three ordering rules all stop at a column-zero `#[cfg(test)]`, because a
+test module legitimately reaches for everything above it and ordering it against
+the code would make every file a violation. **That exemption is only honest if
+the module really is the end of the file** — otherwise production code hides
+below it, in the one region nothing looks at.
+
+Turning this on in the codebase it came from moved test modules in six files and
+immediately exposed seven ordering faults that had been invisible for exactly
+that reason. A second `#[cfg(test)]` item below the first is fine; that is still
+the test region.
+
+An *indented* `#[cfg(test)]` is not the file's boundary — it is a test module
+nested inside some other item. Reading it as one cost two thirds of a real
+file's coverage and reported everything below it as a stowaway.
+
 Three things are ignored outright: `#[cfg(test)]` modules, which stay last;
 prose, because a doc comment saying "kept out of the handler" is not a call to
 `handler`; and files declaring a `macro_rules!`, where a macro must precede its
@@ -98,7 +116,7 @@ The same binary is a one-shot checker, which is what CI should call:
 ```sh
 stratify-lsp --check .
 # crates/…/mod.rs:8: `mod state` uses `semantic`, declared below it (line 12)
-# 2 violation(s) — 235 files, 116 ordered, 27 module lists, 1 workspaces
+# 0 violation(s) — 235 files, 118 ordered, 27 module lists, 1 workspaces
 ```
 
 Non-zero exit when anything is out of order. The counts are not decoration: a
