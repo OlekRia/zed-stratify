@@ -290,6 +290,49 @@ fn fix(root: &Path) -> std::process::ExitCode {
     }
 }
 
+/// Rename module files so a file explorer shows the layering.
+///
+/// The renames go through git when the tree is a repository, so history
+/// follows the file rather than reading as a delete plus an add.
+fn number(root: &Path) -> std::process::ExitCode {
+    let mut files = Vec::new();
+    stratify::source_files(root, &mut files);
+
+    let mut moved = 0usize;
+    for path in files
+        .iter()
+        .filter(|p| p.file_name().is_some_and(|n| n == "mod.rs" || n == "lib.rs"))
+    {
+        let Ok(source) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Some((text, renames)) = stratify::numbered_layout(path, &source) else {
+            continue;
+        };
+        for (from, to) in &renames {
+            // NOT .current_dir(root): these paths are already relative to
+            // the process, and setting it doubled the prefix — every git mv
+            // failed and every rename fell back to a delete plus an add.
+            let via_git = std::process::Command::new("git")
+                .args(["mv", "--", &from.to_string_lossy(), &to.to_string_lossy()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if via_git || std::fs::rename(from, to).is_ok() {
+                println!(
+                    "{} -> {}",
+                    from.file_name().unwrap_or_default().to_string_lossy(),
+                    to.file_name().unwrap_or_default().to_string_lossy()
+                );
+                moved += 1;
+            }
+        }
+        let _ = std::fs::write(path, text);
+    }
+    println!("{moved} file(s) renumbered");
+    std::process::ExitCode::SUCCESS
+}
+
 /// The standalone check, so this binary is testable without an editor.
 fn check(root: &Path) -> std::process::ExitCode {
     let report = stratify::check_tree(root);
@@ -318,9 +361,29 @@ fn main() -> std::process::ExitCode {
             let root = rest.first().map_or(".", String::as_str);
             check(Path::new(root))
         }
+        Some((flag, rest)) if flag == "--number" => {
+            let root = rest.first().map_or(".", String::as_str);
+            number(Path::new(root))
+        }
         Some((flag, rest)) if flag == "--fix" => {
             let root = rest.first().map_or(".", String::as_str);
             fix(Path::new(root))
+        }
+        // ONLY a bare invocation speaks LSP. A misspelt flag used to fall
+        // through to here and block on stdin, which from the outside is a
+        // program that has hung.
+        Some((flag, _)) if flag.starts_with('-') => {
+            eprintln!(
+                "stratify-lsp — dependencies above dependents\n\
+                 \n\
+                 (no arguments)     speak LSP on stdin/stdout\n\
+                 --check <dir>      report violations, non-zero if any\n\
+                 --fix <dir>        repair what can be repaired\n\
+                 --number <dir>     renumber module files so an explorer shows the order\n\
+                 \n\
+                 unrecognised: {flag}"
+            );
+            std::process::ExitCode::FAILURE
         }
         _ => {
             serve();

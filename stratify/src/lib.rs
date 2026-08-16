@@ -37,7 +37,7 @@
 
 mod fix;
 
-pub use fix::fix_source;
+pub use fix::{fix_source, numbered_layout};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -433,20 +433,41 @@ struct Declaration {
 fn declarations_of(dir: &Path, source: &str) -> Vec<Declaration> {
     let cut = tests_begin(source);
     let mut out = Vec::new();
+    let mut explicit_path: Option<String> = None;
 
     for (n, line) in source.lines().enumerate() {
         if n >= cut {
             break;
         }
+        // `#[path = "01_web_product.rs"]` decouples the FILE NAME from the
+        // module name, which is the only way to make a file explorer show the
+        // stratification — explorers sort alphabetically and nothing in an
+        // editor's extension API can change that. Honour it, or a numbered
+        // crate looks dependency-free and every rule here goes quiet.
+        if let Some(rest) = line.trim_start().strip_prefix("#[path") {
+            explicit_path = rest
+                .split('"')
+                .nth(1)
+                .map(str::to_owned);
+            continue;
+        }
         let Some(name) = declared_module_name(line) else {
+            explicit_path = None;
             continue;
         };
+        let file = explicit_path
+            .take()
+            .unwrap_or_else(|| format!("{name}.rs"));
 
         let mut owned = String::new();
-        if let Ok(text) = std::fs::read_to_string(dir.join(format!("{name}.rs"))) {
+        if let Ok(text) = std::fs::read_to_string(dir.join(&file)) {
             owned.push_str(&architecture_of(&text));
         }
-        let sub = dir.join(&name);
+        // A `#[path]` pointing at `x/mod.rs` names the directory `x`.
+        let sub = match file.strip_suffix("/mod.rs") {
+            Some(folder) => dir.join(folder),
+            None => dir.join(&name),
+        };
         if sub.is_dir() {
             let mut files = Vec::new();
             source_files(&sub, &mut files);
@@ -1083,6 +1104,37 @@ mod tests {
 
         let good = "mod web_product;\npub use web_product::*;\n\nmod uses_it;\npub use uses_it::*;\n";
         std::fs::write(dir.join("lib.rs"), good).expect("write");
+        assert!(check_file(&dir.join("lib.rs")).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Numbering the FILES is the only way to make an explorer show the
+    /// layering — and if the rules stopped following `#[path]`, a numbered
+    /// crate would look dependency-free and report a confident clean.
+    #[test]
+    fn when_a_module_file_is_numbered_then_its_edges_are_still_seen() {
+        let dir = std::env::temp_dir().join("stratify-path-attr-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("02_high.rs"), "use crate::Low;\npub fn go(_: Low) {}\n").expect("w");
+        std::fs::write(dir.join("01_low.rs"), "pub struct Low;\n").expect("w");
+
+        let bad = concat!(
+            "#[path = \"02_high.rs\"]\nmod high;\npub use high::*;\n\n",
+            "#[path = \"01_low.rs\"]\nmod low;\npub use low::*;\n",
+        );
+        std::fs::write(dir.join("lib.rs"), bad).expect("w");
+        let found = check_file(&dir.join("lib.rs"));
+        assert_eq!(found.len(), 1, "the edge survives the rename: {found:#?}");
+        assert_eq!(found[0].name, "high");
+        assert_eq!(found[0].uses, "low");
+
+        let good = concat!(
+            "#[path = \"01_low.rs\"]\nmod low;\npub use low::*;\n\n",
+            "#[path = \"02_high.rs\"]\nmod high;\npub use high::*;\n",
+        );
+        std::fs::write(dir.join("lib.rs"), good).expect("w");
         assert!(check_file(&dir.join("lib.rs")).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
